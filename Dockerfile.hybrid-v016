@@ -159,6 +159,7 @@ RUN python3 -c "import torch; print(f'torch:  {torch.__version__}')" && \
 
 # -- 8. Copy scripts from repo --------------------------------------
 COPY scripts/01-rocm-envs.sh /etc/profile.d/01-rocm-envs.sh
+COPY scripts/02-cache-persist.sh /etc/profile.d/02-cache-persist.sh
 COPY scripts/99-toolbox-banner.sh /etc/profile.d/99-toolbox-banner.sh
 COPY scripts/zz-venv-last.sh /etc/profile.d/zz-venv-last.sh
 RUN chmod 0644 /etc/profile.d/*.sh
