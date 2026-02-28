@@ -1,0 +1,166 @@
+# Hybrid vLLM 0.16.x on old ROCm 7.11 stack
+# Strategy: Keep working Triton 3.6.0 + PyTorch 2.11 + ROCm 7.11
+#           Only upgrade vLLM from 0.14 to 0.16.x
+#
+# Base: kyuz0's Docker Hub image (known-good FP8 on gfx1201)
+# Issue: https://git.int.vardalab.com/rkanders/devops/issues/541
+
+FROM docker.io/kyuz0/vllm-therock-gfx1201:latest
+
+# Record what we started with
+RUN python3 -c "import torch; print(f'Base torch: {torch.__version__}')" && \
+    python3 -c "import triton; print(f'Base triton: {triton.__version__}')" && \
+    python3 -c "import vllm; print(f'Base vllm: {vllm.__version__}')"
+
+# -- 0. Remove old vLLM (keep everything else) ----------------------
+RUN pip uninstall -y vllm && \
+    rm -rf /opt/vllm && \
+    rm -rf /tmp/dist
+
+# -- 1. Upgrade dependencies that vLLM 0.16.x needs -----------------
+RUN pip install --no-cache-dir \
+    "transformers>=4.56.0,<5" \
+    "compressed-tensors==0.13.0" \
+    "tokenizers>=0.21.1" \
+    "openai>=1.99.1" \
+    "pydantic>=2.12.0" \
+    "depyf==0.20.0" \
+    "msgspec" \
+    "conch-triton-kernels==1.2.1" \
+    "xgrammar==0.1.29" \
+    "outlines_core==0.2.11" \
+    "lm-format-enforcer==0.11.3" \
+    "llguidance>=1.3.0,<1.4.0" \
+    "gguf>=0.17.0" \
+    "mistral_common[image]>=1.9.1" \
+    "timm>=1.0.17" \
+    "aiohttp>=3.13.3"
+
+# -- 2. Clone vLLM at pinned v0.16.1rc0 -----------------------------
+ARG VLLM_COMMIT=3827c8c55aaa6622fd96b0c846a38b94444ebb80
+RUN git clone https://github.com/vllm-project/vllm.git /opt/vllm && \
+    cd /opt/vllm && \
+    git checkout ${VLLM_COMMIT}
+WORKDIR /opt/vllm
+
+# -- 3. Patch 1+2: amdsmi detection bypass (same as kyuz0) ----------
+RUN echo "import sys, re" > patch_vllm.py && \
+    echo "from pathlib import Path" >> patch_vllm.py && \
+    echo "p = Path('vllm/platforms/__init__.py')" >> patch_vllm.py && \
+    echo "txt = p.read_text()" >> patch_vllm.py && \
+    echo "txt = txt.replace('import amdsmi', '# import amdsmi')" >> patch_vllm.py && \
+    echo "txt = re.sub(r'is_rocm = .*', 'is_rocm = True', txt)" >> patch_vllm.py && \
+    echo "txt = re.sub(r'if len\(amdsmi\.amdsmi_get_processor_handles\(\)\) > 0:', 'if True:', txt)" >> patch_vllm.py && \
+    echo "txt = txt.replace('amdsmi.amdsmi_init()', 'pass')" >> patch_vllm.py && \
+    echo "txt = txt.replace('amdsmi.amdsmi_shut_down()', 'pass')" >> patch_vllm.py && \
+    echo "p.write_text(txt)" >> patch_vllm.py && \
+    echo "p = Path('vllm/platforms/rocm.py')" >> patch_vllm.py && \
+    echo "txt = p.read_text()" >> patch_vllm.py && \
+    echo "header = 'import sys\nfrom unittest.mock import MagicMock\nsys.modules[\"amdsmi\"] = MagicMock()\n'" >> patch_vllm.py && \
+    echo "txt = header + txt" >> patch_vllm.py && \
+    echo "txt = re.sub(r'device_type = .*', 'device_type = \"rocm\"', txt)" >> patch_vllm.py && \
+    echo "txt = re.sub(r'device_name = .*', 'device_name = \"gfx1201\"', txt)" >> patch_vllm.py && \
+    echo "p.write_text(txt)" >> patch_vllm.py && \
+    echo "print('Patch 1+2: amdsmi bypass applied')" >> patch_vllm.py && \
+    python patch_vllm.py
+
+# -- 4. Patch 3: Ray pyamdsmi LoadLibrary hardening ------------------
+COPY <<'PYEOF' /tmp/patch_ray.py
+import sys
+from pathlib import Path
+p = Path('/opt/venv/lib64/python3.13/site-packages/ray/_private/accelerators/amd_gpu.py')
+if p.exists():
+    txt = p.read_text()
+    txt = txt.replace(
+        'import ray._private.thirdparty.pyamdsmi as pyamdsmi',
+        'try:\n            import ray._private.thirdparty.pyamdsmi as pyamdsmi\n        except (OSError, ImportError):\n            pyamdsmi = None\n            return 0'
+    )
+    p.write_text(txt)
+    print('Patch 3: Ray pyamdsmi hardened')
+else:
+    print('Patch 3: Ray amd_gpu.py not found, skipping')
+PYEOF
+RUN python3 /tmp/patch_ray.py
+
+# -- 5. Build vLLM from source against old PyTorch 2.11 -------------
+ENV ROCM_HOME="/opt/rocm"
+ENV HIP_PATH="/opt/rocm"
+ENV VLLM_TARGET_DEVICE="rocm"
+ENV PYTORCH_ROCM_ARCH="gfx1201"
+ENV HIP_ARCHITECTURES="gfx1201"
+ENV AMDGPU_TARGETS="gfx1201"
+ENV MAX_JOBS="4"
+ENV CC="/opt/rocm/llvm/bin/clang"
+ENV CXX="/opt/rocm/llvm/bin/clang++"
+
+RUN pip install --no-cache-dir --upgrade cmake ninja packaging wheel numpy \
+    "setuptools-scm>=8" "setuptools<80.0.0" scikit-build-core pybind11
+
+RUN export HIP_DEVICE_LIB_PATH=$(find /opt/rocm -type d -name bitcode -print -quit) && \
+    echo "Compiling with Bitcode: $HIP_DEVICE_LIB_PATH" && \
+    export CMAKE_ARGS="-DROCM_PATH=/opt/rocm -DHIP_PATH=/opt/rocm -DAMDGPU_TARGETS=gfx1201 -DHIP_ARCHITECTURES=gfx1201" && \
+    python -m pip wheel --no-build-isolation --no-deps -w /tmp/dist -v . 2>&1 | tee /tmp/vllm-build.log && \
+    python -m pip install /tmp/dist/*.whl
+
+# -- 6. Post-build: Apply FP8 kernel path patch (Python-only) -------
+COPY <<'PYEOF' /tmp/patch_fp8.py
+import sys
+from pathlib import Path
+import re
+
+init_path = None
+for p in Path('/opt/venv').rglob('model_executor/kernels/linear/__init__.py'):
+    if '__pycache__' not in str(p):
+        init_path = p
+        break
+
+if init_path is None:
+    print('Patch 4: kernel init not found, skipping')
+    sys.exit(0)
+
+txt = init_path.read_text()
+if 'PlatformEnum.ROCM' in txt:
+    old = """PlatformEnum.ROCM: [
+        ROCmFP8ScaledMMLinearKernel,
+        PerTensorTorchFP8ScaledMMLinearKernel,
+        RowWiseTorchFP8ScaledMMLinearKernel,
+        ChannelWiseTorchFP8ScaledMMLinearKernel,
+    ],"""
+    new = """PlatformEnum.ROCM: [
+        ChannelWiseTorchFP8ScaledMMLinearKernel,
+        ROCmFP8ScaledMMLinearKernel,
+        PerTensorTorchFP8ScaledMMLinearKernel,
+        RowWiseTorchFP8ScaledMMLinearKernel,
+    ],"""
+    if old in txt:
+        txt = txt.replace(old, new)
+        init_path.write_text(txt)
+        print('Patch 4: FP8 kernel priority reordered')
+    else:
+        print('Patch 4: ROCm FP8 kernel block not found as expected')
+else:
+    print('Patch 4: No ROCM platform entry found')
+PYEOF
+RUN python3 /tmp/patch_fp8.py
+
+# -- 6b. CRITICAL: Copy compiled .so files to source tree -----------
+# WORKDIR /opt/vllm shadows the installed package at site-packages.
+# Without this, Python finds the source tree (no .so) before the
+# installed package (_C.abi3.so + _rocm_C.abi3.so). Missing .so
+# causes 37% throughput loss (falls back to pure Python/Triton ops).
+RUN cp /opt/venv/lib64/python3.13/site-packages/vllm/_C.abi3.so /opt/vllm/vllm/ && \
+    cp /opt/venv/lib64/python3.13/site-packages/vllm/_rocm_C.abi3.so /opt/vllm/vllm/
+
+# -- 7. Verify -------------------------------------------------------
+RUN python3 -c "import torch; print(f'torch:  {torch.__version__}')" && \
+    python3 -c "import triton; print(f'triton: {triton.__version__}')" && \
+    python3 -c "import vllm; print(f'vllm:   {vllm.__version__}')" && \
+    echo "Hybrid image built successfully"
+
+# -- 8. Copy scripts from repo --------------------------------------
+COPY scripts/01-rocm-envs.sh /etc/profile.d/01-rocm-envs.sh
+COPY scripts/99-toolbox-banner.sh /etc/profile.d/99-toolbox-banner.sh
+COPY scripts/zz-venv-last.sh /etc/profile.d/zz-venv-last.sh
+RUN chmod 0644 /etc/profile.d/*.sh
+
+CMD ["/bin/bash"]
