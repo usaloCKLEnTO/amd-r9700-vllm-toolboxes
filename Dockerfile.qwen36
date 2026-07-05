@@ -1,0 +1,90 @@
+# vLLM Qwen3.6 lane for dual AMD Radeon AI PRO R9700 (gfx1201 / RDNA4).
+# Issue devops#954.
+#
+# Base: kyuz0's prebuilt runtime image, PINNED BY DIGEST for reproducibility
+# (kyuz0's own Dockerfile clones vLLM main unpinned; the digest freezes it).
+#   vLLM   0.22.1rc1.dev499+g470229c37.d20260613  (commit 470229c37, 2026-06-13)
+#   ROCm   7.14 nightly
+#   Torch  2.13
+#
+# The base image ships upstream vLLM PR #42076 (Hopper/WGMMA layout change) which
+# MIS-COMPILES the Gated-DeltaNet chunk_scaled_dot_kkt Triton kernel on gfx1201
+# and deadlocks the TP>=2 profiling forward pass. Upstream fix is PR #46190
+# (root-caused to #42076, still OPEN as of 2026-07-05). We vendor it here as a
+# post-install patch. The gate is CUDA-neutral: current_platform.is_cuda() is
+# True on NVIDIA (identical to stock), False on ROCm (pre-#42076 layout).
+FROM docker.io/kyuz0/vllm-therock-gfx1201@sha256:55fa7796374a281e4b77a05cc2f26391d4100a5abb738f77c580ebc3951761e9
+
+# Vendored patch: upstream vLLM PR #46190 — gate the WGMMA-layout tl.dot behind
+# CAST_K_TRANS. Idempotent; fails the build loudly if any anchor drifts.
+COPY <<'PYEOF' /tmp/patch_gdn_kkt.py
+#!/usr/bin/env python3
+"""Vendor upstream vLLM PR #46190 into the GDN chunk_scaled_dot_kkt kernel.
+
+The #42076 Hopper WGMMA layout mis-compiles on ROCm/RDNA4 (gfx1201) and hangs
+the TP>=2 profiling forward pass. This gates it behind CAST_K_TRANS, which is
+current_platform.is_cuda() at launch: unchanged on NVIDIA, pre-#42076 layout on
+ROCm. Idempotent. Issue devops#954."""
+import ast
+import os
+import sys
+
+import vllm
+
+path = os.path.join(
+    os.path.dirname(vllm.__file__),
+    "model_executor/layers/fla/ops/chunk_scaled_dot_kkt.py",
+)
+src = open(path).read()
+
+if "CAST_K_TRANS" in src:
+    print(f"[patch_gdn_kkt] already patched, skipping: {path}")
+    sys.exit(0)
+
+edits = [
+    # (a) import current_platform
+    (
+        "from vllm.triton_utils import tl, triton\n",
+        "from vllm.triton_utils import tl, triton\n"
+        "from vllm.platforms import current_platform\n",
+    ),
+    # (b) add constexpr param to the kernel signature
+    (
+        "    USE_G: tl.constexpr,\n):\n",
+        "    USE_G: tl.constexpr,\n    CAST_K_TRANS: tl.constexpr,\n):\n",
+    ),
+    # (c) gate the WGMMA-layout tl.dot
+    (
+        "        b_A += tl.dot(b_kb, tl.trans(b_k).to(b_kb.dtype))\n",
+        "        if CAST_K_TRANS:\n"
+        "            # NVIDIA Hopper: WGMMA-aligned layout (vLLM PR #42076)\n"
+        "            b_A += tl.dot(b_kb, tl.trans(b_k).to(b_kb.dtype))\n"
+        "        else:\n"
+        "            # ROCm/RDNA4 (gfx1201): pre-#42076 layout; WGMMA layout\n"
+        "            # mis-compiles and deadlocks TP>=2 profiling (vLLM PR #46190)\n"
+        "            b_A += tl.dot(b_kb.to(b_k.dtype), tl.trans(b_k))\n",
+    ),
+    # (d) pass CAST_K_TRANS at the kernel launch
+    (
+        "        K=K,\n        BT=BT,\n    )\n",
+        "        K=K,\n        BT=BT,\n        CAST_K_TRANS=current_platform.is_cuda(),\n    )\n",
+    ),
+]
+
+for i, (anchor, repl) in enumerate(edits):
+    n = src.count(anchor)
+    if n != 1:
+        sys.exit(
+            f"[patch_gdn_kkt] FATAL: edit {i} anchor matched {n} times "
+            f"(expected 1) in {path}"
+        )
+    src = src.replace(anchor, repl)
+
+ast.parse(src)  # reject the build if the patch produced invalid Python
+open(path, "w").write(src)
+print(f"[patch_gdn_kkt] applied vLLM PR #46190 CAST_K_TRANS gate to {path}")
+PYEOF
+
+RUN python3 /tmp/patch_gdn_kkt.py && \
+    python3 -c "import ast, os, vllm; ast.parse(open(os.path.join(os.path.dirname(vllm.__file__), 'model_executor/layers/fla/ops/chunk_scaled_dot_kkt.py')).read()); print('[verify] chunk_scaled_dot_kkt.py parses clean')" && \
+    grep -q 'CAST_K_TRANS' "$(python3 -c 'import os, vllm; print(os.path.join(os.path.dirname(vllm.__file__), "model_executor/layers/fla/ops/chunk_scaled_dot_kkt.py"))')"
