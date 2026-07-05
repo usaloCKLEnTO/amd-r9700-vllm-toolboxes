@@ -3,6 +3,7 @@
 
 <head>
     <meta charset="UTF-8">
+    <script defer data-domain="kyuz0.github.io/amd-r9700-vllm-toolboxes" src="https://plausible.skybound.link/js/plausible.js"></script>
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>AMD R9700 vLLM Benchmarks</title>
     <style>
@@ -55,10 +56,10 @@
         /* Controls */
         .controls {
             display: flex;
-            gap: 16px;
+            gap: 12px;
             margin-bottom: 24px;
             background: var(--bg-card);
-            padding: 16px;
+            padding: 12px 16px;
             border-radius: 12px;
             box-shadow: 0 1px 3px rgba(0, 0, 0, 0.05);
             border: 1px solid var(--border);
@@ -84,7 +85,20 @@
 
         .search {
             flex: 1;
-            min-width: 200px;
+            min-width: 180px;
+            max-width: 220px;
+            background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' fill='none' viewBox='0 0 24 24' stroke='%239ca3af'%3E%3Cpath stroke-linecap='round' stroke-linejoin='round' stroke-width='2' d='M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z'/%3E%3C/svg%3E");
+            background-repeat: no-repeat;
+            background-position: 12px center;
+            background-size: 16px;
+            padding-left: 36px;
+        }
+
+        .filters-wrapper {
+            display: flex;
+            align-items: center;
+            gap: 12px;
+            flex-wrap: wrap;
         }
 
         /* Section Cards */
@@ -200,6 +214,11 @@
 
         .highlight {
             color: var(--primary);
+        }
+
+        .best-cell {
+            background-color: #d1fae5 !important;
+            color: #065f46 !important;
         }
 
         /* Modal/Overlay */
@@ -403,27 +422,40 @@
         .filter-group {
             display: flex;
             align-items: center;
-            gap: 12px;
-            padding: 0 12px;
+            gap: 8px;
+            padding: 0 4px 0 12px;
             border-left: 1px solid var(--border);
         }
 
         .check-item {
-            display: flex;
+            display: inline-flex;
             align-items: center;
             gap: 6px;
-            font-size: 0.9rem;
+            font-size: 0.85rem;
             color: var(--text-muted);
             cursor: pointer;
             user-select: none;
+            padding: 4px 8px;
+            border-radius: 6px;
+            border: 1px solid transparent;
+            transition: all 0.2s ease;
         }
 
         .check-item input[type="checkbox"] {
             accent-color: var(--primary);
+            margin: 0;
         }
 
         .check-item:hover {
             color: var(--text-main);
+            background: #f3f4f6;
+        }
+
+        .check-item:has(input:checked) {
+            color: var(--primary);
+            background: var(--primary-bg);
+            border-color: rgba(239, 68, 68, 0.15);
+            font-weight: 500;
         }
     </style>
 </head>
@@ -451,17 +483,20 @@
             <select id="quantFilter">
                 <option value="">All Quantizations</option>
             </select>
-            <div class="filter-group">
-                <span style="font-size:0.8rem; font-weight:600; color:var(--text-muted); margin-right:6px;">GPUs:</span>
-                <label class="check-item"><input type="checkbox" id="chkTP1" checked> TP1</label>
-                <label class="check-item"><input type="checkbox" id="chkTP2" checked> TP2</label>
-            </div>
+            <div class="filters-wrapper">
+                <div class="filter-group">
+                    <span style="font-size:0.8rem; font-weight:600; color:var(--text-muted); margin-right:6px;">GPUs:</span>
+                    <label class="check-item"><input type="checkbox" id="chkTP1" checked> TP1</label>
+                    <label class="check-item"><input type="checkbox" id="chkTP2" checked> TP2</label>
+                </div>
 
-            <div class="filter-group">
-                <span
-                    style="font-size:0.8rem; font-weight:600; color:var(--text-muted); margin-right:6px;">Attention:</span>
-                <label class="check-item"><input type="checkbox" id="chkTriton" checked> Triton</label>
-                <label class="check-item"><input type="checkbox" id="chkROCm"> ROCm</label>
+                <div class="filter-group">
+                    <span
+                        style="font-size:0.8rem; font-weight:600; color:var(--text-muted); margin-right:6px;">Attention:</span>
+                    <label class="check-item"><input type="checkbox" id="chkTriton" checked> Triton</label>
+                    <label class="check-item"><input type="checkbox" id="chkROCm"> ROCm</label>
+                    <label class="check-item"><input type="checkbox" id="chkAITER" checked> AITER</label>
+                </div>
             </div>
         </div>
 
@@ -529,7 +564,8 @@
                 tp1: true,
                 tp2: true,
                 triton: true,
-                rocm: false
+                rocm: false,
+                aiter: true
             }
         };
 
@@ -598,8 +634,10 @@
                         params: run.params_b || run.name_params_b,
                         tp1: null,
                         tp1_rocm: null,
+                        tp1_aiter: null,
                         tp2: null,
-                        tp2_rocm: null
+                        tp2_rocm: null,
+                        tp2_aiter: null
                     };
                 }
 
@@ -608,10 +646,12 @@
                 // Assign TP value
                 if (run.env === "TP1") {
                     if (run.variant === "rocm") m.tp1_rocm = run.tps_mean;
+                    else if (run.variant === "aiter") m.tp1_aiter = run.tps_mean;
                     else m.tp1 = run.tps_mean;
                 }
                 if (run.env === "TP2") {
                     if (run.variant === "rocm") m.tp2_rocm = run.tps_mean;
+                    else if (run.variant === "aiter") m.tp2_aiter = run.tps_mean;
                     else m.tp2 = run.tps_mean;
                 }
             });
@@ -668,6 +708,7 @@
             bindCheck('chkTP2', 'tp2');
             bindCheck('chkTriton', 'triton');
             bindCheck('chkROCm', 'rocm');
+            bindCheck('chkAITER', 'aiter');
         }
 
         function getBenchmarkMeta(testName) {
@@ -771,16 +812,27 @@
 
             if (state.view.tp1) {
                 if (state.view.triton) headerHTML += '<th class="col-data">TP1<br><span style="font-weight:400; font-size:0.85em; text-transform:none;">Triton</span></th>';
-                if (state.view.rocm) headerHTML += '<th class="col-data" style="background:#fefce8;">TP1<br><span style="font-weight:400; font-size:0.85em; text-transform:none;">ROCm</span></th>';
+                if (state.view.rocm) headerHTML += '<th class="col-data">TP1<br><span style="font-weight:400; font-size:0.85em; text-transform:none;">ROCm</span></th>';
+                if (state.view.aiter) headerHTML += '<th class="col-data">TP1<br><span style="font-weight:400; font-size:0.85em; text-transform:none;">AITER</span></th>';
             }
             if (state.view.tp2) {
                 if (state.view.triton) headerHTML += '<th class="col-data">TP2<br><span style="font-weight:400; font-size:0.85em; text-transform:none;">Triton</span></th>';
-                if (state.view.rocm) headerHTML += '<th class="col-data" style="background:#fefce8;">TP2<br><span style="font-weight:400; font-size:0.85em; text-transform:none;">ROCm</span></th>';
+                if (state.view.rocm) headerHTML += '<th class="col-data">TP2<br><span style="font-weight:400; font-size:0.85em; text-transform:none;">ROCm</span></th>';
+                if (state.view.aiter) headerHTML += '<th class="col-data">TP2<br><span style="font-weight:400; font-size:0.85em; text-transform:none;">AITER</span></th>';
             }
 
             headerHTML += '</tr>';
             thead.innerHTML = headerHTML;
             table.appendChild(thead);
+
+            // Determine if higher value is better performance
+            const isHigherBetter = !state.activeTab.includes("TTFT") && !state.activeTab.includes("TPOT");
+            const isValid = v => v !== null && v !== undefined && v !== 0;
+            const getBestVal = (vals) => {
+                if (vals.length === 0) return null;
+                return isHigherBetter ? Math.max(...vals) : Math.min(...vals);
+            };
+            const activeBackendsCount = (state.view.triton ? 1 : 0) + (state.view.rocm ? 1 : 0) + (state.view.aiter ? 1 : 0);
 
             const tbody = document.createElement('tbody');
             models.forEach(m => {
@@ -794,6 +846,30 @@
                 // Values
                 const unit = meta ? meta.unit : "";
 
+                // Calculate best TP1 and TP2 values among active/visible backends
+                const tp1Vals = [];
+                if (state.view.tp1) {
+                    if (state.view.triton && isValid(m.tp1)) tp1Vals.push(m.tp1);
+                    if (state.view.rocm && isValid(m.tp1_rocm)) tp1Vals.push(m.tp1_rocm);
+                    if (state.view.aiter && isValid(m.tp1_aiter)) tp1Vals.push(m.tp1_aiter);
+                }
+                const bestTp1 = activeBackendsCount > 1 ? getBestVal(tp1Vals) : null;
+
+                const tp2Vals = [];
+                if (state.view.tp2) {
+                    if (state.view.triton && isValid(m.tp2)) tp2Vals.push(m.tp2);
+                    if (state.view.rocm && isValid(m.tp2_rocm)) tp2Vals.push(m.tp2_rocm);
+                    if (state.view.aiter && isValid(m.tp2_aiter)) tp2Vals.push(m.tp2_aiter);
+                }
+                const bestTp2 = activeBackendsCount > 1 ? getBestVal(tp2Vals) : null;
+
+                const getCellClass = (val, bestVal) => {
+                    if (bestVal !== null && isValid(val) && val === bestVal) {
+                        return "col-data best-cell";
+                    }
+                    return "col-data";
+                };
+
                 let rowHTML = `
                 <td>
                     <div class="model-cell">
@@ -803,12 +879,14 @@
                 </td>`;
 
                 if (state.view.tp1) {
-                    if (state.view.triton) rowHTML += `<td class="col-data">${formatVal(m.tp1, unit)}</td>`;
-                    if (state.view.rocm) rowHTML += `<td class="col-data" style="background:#fffbeb;">${formatVal(m.tp1_rocm, unit)}</td>`;
+                    if (state.view.triton) rowHTML += `<td class="${getCellClass(m.tp1, bestTp1)}">${formatVal(m.tp1, unit)}</td>`;
+                    if (state.view.rocm) rowHTML += `<td class="${getCellClass(m.tp1_rocm, bestTp1)}">${formatVal(m.tp1_rocm, unit)}</td>`;
+                    if (state.view.aiter) rowHTML += `<td class="${getCellClass(m.tp1_aiter, bestTp1)}">${formatVal(m.tp1_aiter, unit)}</td>`;
                 }
                 if (state.view.tp2) {
-                    if (state.view.triton) rowHTML += `<td class="col-data">${formatVal(m.tp2, unit)}</td>`;
-                    if (state.view.rocm) rowHTML += `<td class="col-data" style="background:#fffbeb;">${formatVal(m.tp2_rocm, unit)}</td>`;
+                    if (state.view.triton) rowHTML += `<td class="${getCellClass(m.tp2, bestTp2)}">${formatVal(m.tp2, unit)}</td>`;
+                    if (state.view.rocm) rowHTML += `<td class="${getCellClass(m.tp2_rocm, bestTp2)}">${formatVal(m.tp2_rocm, unit)}</td>`;
+                    if (state.view.aiter) rowHTML += `<td class="${getCellClass(m.tp2_aiter, bestTp2)}">${formatVal(m.tp2_aiter, unit)}</td>`;
                 }
 
                 tr.innerHTML = rowHTML;

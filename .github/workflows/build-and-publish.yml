@@ -4,9 +4,21 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "Image tag to publish (e.g. latest)"
+        description: "Image tag to publish (e.g. dev)"
         required: true
-        default: "latest"
+        default: "dev"
+      rccl_run_id:
+        description: "Run ID of build-rccl to use (leave empty for latest)"
+        required: false
+        default: ""
+      dockerfile:
+        description: "Which Dockerfile to build"
+        required: true
+        type: choice
+        default: "Dockerfile"
+        options:
+          - Dockerfile
+          - Dockerfile.rocm7.2.3
 
 env:
   IMAGE_REPO: kyuz0/vllm-therock-gfx1201
@@ -59,6 +71,7 @@ jobs:
         with:
           buildkitd-flags: --config /tmp/buildkitd.toml
 
+
       - name: Log in to Docker Hub
         uses: docker/login-action@v3
         with:
@@ -83,7 +96,7 @@ jobs:
         uses: docker/build-push-action@v6
         with:
           context: .
-          file: ./Dockerfile
+          file: ./${{ github.event.inputs.dockerfile }}
           platforms: linux/amd64
           push: true
           tags: ${{ steps.meta.outputs.tags }}
