@@ -88,3 +88,141 @@ PYEOF
 RUN python3 /tmp/patch_gdn_kkt.py && \
     python3 -c "import ast, os, vllm; ast.parse(open(os.path.join(os.path.dirname(vllm.__file__), 'model_executor/layers/fla/ops/chunk_scaled_dot_kkt.py')).read()); print('[verify] chunk_scaled_dot_kkt.py parses clean')" && \
     grep -q 'CAST_K_TRANS' "$(python3 -c 'import os, vllm; print(os.path.join(os.path.dirname(vllm.__file__), "model_executor/layers/fla/ops/chunk_scaled_dot_kkt.py"))')"
+
+# Vendored R9700 AITER runtime deltas distilled from andysalerno/r9700-serving.
+# These keep broad AITER usable on gfx1201, disable the AITER sampler on gfx12x
+# (its JIT path fails there), and fix the GDN/Mamba cache lookup used by MTP.
+COPY <<'PYEOF' /tmp/patch_r9700_aiter.py
+#!/usr/bin/env python3
+"""Patch vLLM for R9700 AITER unified attention + Qwen3.6 MTP experiments.
+
+The base image has the backend present, but only partially supports gfx1201:
+is_aiter_found_and_supported() excludes gfx12x, broad AITER enables a sampler
+JIT that fails on R9700, and the Mamba/GDN cache manager can drop the state
+block during speculative decode cache lookup. Idempotent. Issue devops#954.
+"""
+import ast
+import os
+import sys
+
+import vllm
+
+
+ROOT = os.path.dirname(vllm.__file__)
+
+
+def path(rel: str) -> str:
+    return os.path.join(ROOT, rel)
+
+
+def replace(rel: str, anchor: str, repl: str, marker: str | None = None) -> None:
+    p = path(rel)
+    src = open(p).read()
+    if marker and marker in src:
+        print(f"[patch_r9700_aiter] already patched marker={marker}: {rel}")
+        return
+    n = src.count(anchor)
+    if n != 1:
+        sys.exit(
+            f"[patch_r9700_aiter] FATAL: {rel} anchor matched {n} times "
+            f"(expected 1): {anchor!r}"
+        )
+    src = src.replace(anchor, repl)
+    ast.parse(src)
+    open(p, "w").write(src)
+    print(f"[patch_r9700_aiter] patched {rel}")
+
+
+replace(
+    "_aiter_ops.py",
+    "        from vllm.platforms.rocm import on_mi3xx\n\n        return on_mi3xx()\n",
+    "        from vllm.platforms.rocm import on_gfx12x, on_mi3xx\n\n"
+    "        return on_mi3xx() or on_gfx12x()\n",
+    marker="return on_mi3xx() or on_gfx12x()",
+)
+
+replace(
+    "_aiter_ops.py",
+    "    @classmethod\n    @if_aiter_supported\n    def is_linear_enabled(cls) -> bool:\n",
+    "    @classmethod\n"
+    "    @if_aiter_supported\n"
+    "    def is_sampler_enabled(cls) -> bool:\n"
+    "        from vllm.platforms.rocm import on_mi3xx\n\n"
+    "        # AITER's sampler JIT does not support gfx12x/RDNA4, even though\n"
+    "        # other AITER paths such as unified attention can run there.\n"
+    "        return cls._AITER_ENABLED and on_mi3xx()\n\n"
+    "    @classmethod\n"
+    "    @if_aiter_supported\n"
+    "    def is_linear_enabled(cls) -> bool:\n",
+    marker="def is_sampler_enabled",
+)
+
+replace(
+    "v1/sample/ops/topk_topp_sampler.py",
+    "            and rocm_aiter_ops.is_enabled()\n",
+    "            and rocm_aiter_ops.is_sampler_enabled()\n",
+    marker="rocm_aiter_ops.is_sampler_enabled()",
+)
+
+replace(
+    "v1/core/single_type_kv_cache_manager.py",
+    "        block_size = kv_cache_spec.block_size\n"
+    "        max_num_blocks = max_length // block_size\n"
+    "        # Search from right to left and early stop when a match is found.\n",
+    "        block_size = kv_cache_spec.block_size\n"
+    "        max_num_blocks = max_length // block_size\n"
+    "        if drop_eagle_block and max_num_blocks > 0:\n"
+    "            # Full-attention cache hit lookup matches one extra block and\n"
+    "            # then drops that final block as it is only partially accepted.\n"
+    "            # Mamba/GDN state blocks are [null, ..., state], so popping after\n"
+    "            # a match removes the state. Search only up to the boundary.\n"
+    "            max_num_blocks -= 1\n"
+    "        # Search from right to left and early stop when a match is found.\n",
+    marker="Mamba/GDN state blocks are [null, ..., state]",
+)
+
+replace(
+    "v1/attention/backends/rocm_aiter_unified_attn.py",
+    "        from aiter.ops.triton.unified_attention import unified_attention\n",
+    "        from aiter.ops.triton.attention.unified_attention import unified_attention\n",
+    marker="aiter.ops.triton.attention.unified_attention",
+)
+
+replace(
+    "platforms/rocm.py",
+    "        if rocm_aiter_ops.is_enabled() and on_gfx9():\n",
+    "        if rocm_aiter_ops.is_mha_enabled() and (on_gfx9() or on_gfx12x()):\n",
+    marker="rocm_aiter_ops.is_mha_enabled() and (on_gfx9() or on_gfx12x())",
+)
+
+replace(
+    "v1/attention/backends/rocm_aiter_fa.py",
+    "        from vllm.platforms.rocm import on_mi3xx\n\n"
+    "        # DeviceCapability is currently created using torch.cuda.get_device_capability()\n"
+    "        # which is known to be buggy on rocm systems. on_mi3xx uses amd-smi which is\n"
+    "        # more reliable.\n"
+    "        return on_mi3xx()\n",
+    "        from vllm.platforms.rocm import on_gfx12x, on_mi3xx\n\n"
+    "        # DeviceCapability is currently created using torch.cuda.get_device_capability()\n"
+    "        # which is known to be buggy on rocm systems. These helpers use cached GCN\n"
+    "        # arch state from ROCm, which is more reliable.\n"
+    "        return on_mi3xx() or on_gfx12x()\n",
+    marker="return on_mi3xx() or on_gfx12x()",
+)
+
+for rel in (
+    "_aiter_ops.py",
+    "platforms/rocm.py",
+    "v1/attention/backends/rocm_aiter_fa.py",
+    "v1/attention/backends/rocm_aiter_unified_attn.py",
+    "v1/core/single_type_kv_cache_manager.py",
+    "v1/sample/ops/topk_topp_sampler.py",
+):
+    ast.parse(open(path(rel)).read())
+
+print("[patch_r9700_aiter] all patched files parse clean")
+PYEOF
+
+RUN python3 /tmp/patch_r9700_aiter.py && \
+    grep -q 'def is_sampler_enabled' "$(python3 -c 'import os, vllm; print(os.path.join(os.path.dirname(vllm.__file__), "_aiter_ops.py"))')" && \
+    grep -q 'Mamba/GDN state blocks' "$(python3 -c 'import os, vllm; print(os.path.join(os.path.dirname(vllm.__file__), "v1/core/single_type_kv_cache_manager.py"))')"
