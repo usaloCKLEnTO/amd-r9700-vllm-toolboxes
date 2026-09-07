@@ -186,7 +186,8 @@ RUN set -eu; \
     ldd "${target}" | grep -q libnccldump_stub.so; \
     ldd "${target}" | grep -q libnccl_devapi_stub.so; \
     ! ldd "${target}" | grep -q 'not found'; \
-    python3 -c 'import ctypes, ctypes.util; l = ctypes.CDLL("librccl.so.1"); v = ctypes.c_int(); l.ncclGetVersion(ctypes.byref(v)); print("rccl version", v.value); assert v.value == 22707, v.value'
+    python3 -c "import ctypes; l = ctypes.CDLL('${target}'); v = ctypes.c_int(); l.ncclGetVersion(ctypes.byref(v)); print('rccl version', v.value); assert v.value == 22707, v.value"; \
+    python3 -c "import torch; print('torch', torch.__version__, 'nccl', torch.cuda.nccl.version())"
 
 LABEL org.opencontainers.image.description="vLLM Radiance (pinned digest) with RCCL 2.27.7 rebuilt NDEBUG for gfx1201 P2P under an emulated PCIe switch (devops#1393)" \
       io.vardalab.rccl.version="2.27.7" \
