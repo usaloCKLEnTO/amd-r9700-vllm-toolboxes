@@ -46,12 +46,20 @@ ENV ROCM_PATH=/opt/rocm \
     HIP_PATH=/opt/rocm \
     DEBIAN_FRONTEND=noninteractive
 
-# The image is pruned: no cmake, no patchelf, no libdrm/libnuma headers.
+# The image is pruned: no cmake, no pkg-config, no patchelf, no libdrm/libnuma
+# headers. pkg-config is what lets find_package(rocm_smi) succeed; without it
+# RCCL falls back to the pre-6.x layout /opt/rocm/rocm_smi/include, which the
+# symlink below also provides so either path reads the same headers.
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
-        cmake ninja-build git ca-certificates g++ patchelf \
+        cmake ninja-build git ca-certificates g++ patchelf pkg-config \
         libdrm-dev libnuma-dev \
-    && rm -rf /var/lib/apt/lists/*
+    && rm -rf /var/lib/apt/lists/* \
+    && test -f /opt/rocm/include/rocm_smi/rocm_smi.h \
+    && mkdir -p /opt/rocm/core-7.14/rocm_smi \
+    && ln -s /opt/rocm/core-7.14/include /opt/rocm/core-7.14/rocm_smi/include \
+    && ln -s /opt/rocm/core-7.14/lib /opt/rocm/core-7.14/rocm_smi/lib \
+    && ln -sfn /opt/rocm/core-7.14/rocm_smi /opt/rocm/rocm_smi
 
 WORKDIR /opt/rccl-src
 RUN git init -q . \
