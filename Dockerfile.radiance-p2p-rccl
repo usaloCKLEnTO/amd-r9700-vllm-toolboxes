@@ -143,6 +143,9 @@ set -euo pipefail
 TORCH_HIP="$(python3 -c 'import os, torch; print(os.path.join(os.path.dirname(torch.__file__), "lib", "libtorch_hip.so"))')"
 PYNCCL="$(python3 -c 'import os, vllm; print(os.path.join(os.path.dirname(vllm.__file__), "distributed", "device_communicators", "pynccl_wrapper.py"))')"
 nm -D --undefined-only "${TORCH_HIP}" | awk '{print $2}' | grep -i nccl | sort -u > /tmp/torch-needs
+# The gates are set differences; an empty extraction would pass vacuously. Floors
+# sized from the 1.0.15 image (41 torch imports, 8 vLLM lookups).
+test "$(wc -l < /tmp/torch-needs)" -ge 20 || { echo "FATAL: torch nccl import extraction returned too few symbols"; exit 1; }
 { nm -D --defined-only /opt/rccl-p2p/librccl-final.so;
   nm -D --defined-only /opt/rccl-p2p/libnccldump_stub.so;
   nm -D --defined-only /opt/rccl-p2p/libnccl_devapi_stub.so; } | awk '{print $3}' | sort -u > /tmp/have
@@ -150,6 +153,7 @@ missing="$(comm -23 /tmp/torch-needs /tmp/have || true)"
 echo "torch nccl imports: $(wc -l < /tmp/torch-needs); missing: $(printf '%s' "${missing}" | grep -c . || true)"
 if [ -n "${missing}" ]; then echo "FATAL: unresolved torch nccl symbols:"; echo "${missing}"; exit 1; fi
 grep -o 'Function("nccl[A-Za-z]*"' "${PYNCCL}" | sed 's/Function("//; s/"//' | sort -u > /tmp/vllm-needs
+test "$(wc -l < /tmp/vllm-needs)" -ge 6 || { echo "FATAL: vLLM pynccl_wrapper extraction returned too few symbols"; exit 1; }
 missing="$(comm -23 /tmp/vllm-needs /tmp/have || true)"
 echo "vLLM pynccl lookups: $(wc -l < /tmp/vllm-needs); missing: $(printf '%s' "${missing}" | grep -c . || true)"
 if [ -n "${missing}" ]; then echo "FATAL: vLLM pynccl_wrapper needs symbols the rebuilt RCCL lacks:"; echo "${missing}"; exit 1; fi
