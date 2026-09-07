@@ -1,0 +1,186 @@
+# vLLM Radiance + NDEBUG-rebuilt RCCL for dual AMD Radeon AI PRO R9700 (gfx1201)
+# passed through to a Proxmox VM on a shared emulated PCIe switch.
+# Issue devops#1393 (P2P topology); consumed by devops#1392 (Radiance lane).
+#
+# Why this image exists
+# ---------------------
+# Guest pci_p2pdma only allows GPU<->GPU peer DMA under a common upstream
+# bridge, so the VM puts both GPUs behind one emulated x3130 switch. That
+# switch drops PCIe AtomicOps, and stock RCCL kernels carry a `hostcall`
+# metadata declaration that ROCr refuses to dispatch without atomics:
+#   HIP failure 'the operation cannot be performed in the present state'
+# (ROCm/ROCm#6520, still present in RCCL 2.30.x). The verified workaround
+# (credit: cadamcat/dual-radeon-vllm, bkvargyas/dual-r9700-vllm-proxmox) is to
+# rebuild RCCL 2.27.7 with NDEBUG forced into the device compile, which strips
+# the hostcall declaration. It must be built INSIDE the serving image so the
+# library matches the image's ROCm 7.14 core ABI.
+#
+# Stage 1 builds RCCL and the two symbol stubs and proves three things at
+# build time (each a hard failure):
+#   1. the gfx1201 device image carries ZERO hidden_hostcall_buffer notes;
+#   2. every nccl* symbol libtorch_hip.so imports resolves against the
+#      rebuilt library plus the stubs (newer torch binds RCCL-2.30-era
+#      symbols eagerly; the stubs return ncclInternalError so accidental use
+#      fails loudly instead of corrupting);
+#   3. every function vLLM's ctypes wrapper (pynccl_wrapper.py) looks up
+#      exists in the rebuilt library.
+# Stage 2 is the pinned Radiance image with the rebuilt library installed
+# over the ROCm core's librccl.so.1.0. The three libraries are also kept
+# under /opt/rccl-p2p/ so a bind-mount over a stock image remains possible.
+#
+# Base: magiccodingman/vllm-radiance 1.0.15, PINNED BY DIGEST (devops#1392).
+#   vLLM 0.28.0, torch 2.12.0+rocm7.14, ROCm core 7.14.0 at /opt/rocm/core-7.14
+ARG RADIANCE_DIGEST=sha256:f728d19a83edd8a019bc6e85f80e8d48099f19e96b87efaddebf8cc22fcf04b1
+
+# ---------------------------------------------------------------------------
+# Stage 1: build RCCL 2.27.7 (release/rocm-rel-7.1.1.1) with NDEBUG
+# ---------------------------------------------------------------------------
+FROM docker.io/magiccodingman/vllm-radiance@${RADIANCE_DIGEST} AS rccl-build
+
+# release/rocm-rel-7.1.1.1 tip on 2026-09-06; RCCL 2.27.7 (makefiles/version.mk).
+ARG RCCL_REF=bf3ebf549fec376521b7d35f09a67f67071c96d3
+ARG GPU_TARGET=gfx1201
+ARG BUILD_JOBS=24
+
+ENV ROCM_PATH=/opt/rocm \
+    HIP_PATH=/opt/rocm \
+    DEBIAN_FRONTEND=noninteractive
+
+# The image is pruned: no cmake, no patchelf, no libdrm/libnuma headers.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        cmake ninja-build git ca-certificates g++ patchelf \
+        libdrm-dev libnuma-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /opt/rccl-src
+RUN git init -q . \
+    && git remote add origin https://github.com/ROCm/rccl.git \
+    && git fetch -q --depth 1 origin "${RCCL_REF}" \
+    && git checkout -q FETCH_HEAD \
+    && grep -q '^NCCL_MAJOR *:= 2$' makefiles/version.mk \
+    && grep -q '^NCCL_MINOR *:= 27$' makefiles/version.mk \
+    && grep -q '^NCCL_PATCH *:= 7$' makefiles/version.mk
+
+# Force NDEBUG into every compile unit (host and device). This is the whole
+# fix: the hostcall declaration only exists in non-NDEBUG device code.
+RUN sed -i '/^project(rccl CXX)/a add_compile_definitions(NDEBUG)' CMakeLists.txt \
+    && grep -q '^add_compile_definitions(NDEBUG)$' CMakeLists.txt
+
+# EXPLICIT_ROCM_VERSION: the image has no /opt/rocm/.info/version (the core
+# keeps it at /opt/rocm/core-7.14/.info/version); read it from there.
+RUN ROCM_VERSION="$(cat /opt/rocm/core-7.14/.info/version)" \
+    && test -n "${ROCM_VERSION}" \
+    && cmake -S . -B build -G Ninja \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DCMAKE_PREFIX_PATH=/opt/rocm \
+        -DROCM_PATH=/opt/rocm \
+        -DEXPLICIT_ROCM_VERSION="${ROCM_VERSION}" \
+        -DGPU_TARGETS="${GPU_TARGET}" \
+        -DAMDGPU_TARGETS="${GPU_TARGET}" \
+        -DBUILD_TESTS=OFF \
+    && ninja -C build -j "${BUILD_JOBS}" \
+    && test -f build/librccl.so.1.0
+
+# Gate 1: zero hostcall declarations on the gfx1201 device image.
+RUN cd build \
+    && /opt/rocm/lib/llvm/bin/llvm-objdump --offloading librccl.so.1.0 \
+    && ls librccl.so.1.0.*"${GPU_TARGET}"* \
+    && for img in librccl.so.1.0.*"${GPU_TARGET}"*; do \
+         n="$(/opt/rocm/lib/llvm/bin/llvm-readelf --notes "${img}" | grep -c hidden_hostcall_buffer || true)"; \
+         echo "${img}: hidden_hostcall_buffer notes = ${n}"; \
+         test "${n}" = "0" || { echo "FATAL: hostcall declarations remain"; exit 1; }; \
+       done
+
+# Symbol stubs (verbatim from bkvargyas/dual-r9700-vllm-proxmox rccl-stubs/).
+COPY <<'CPPEOF' /opt/rccl-src/devapistub.cpp
+// Load-time stubs for RCCL 2.30-era symbols that torch 2.11/2.12 (ROCm builds)
+// reference eagerly but RCCL 2.27.7 lacks. vLLM tensor-parallel inference never
+// calls these (symmetric-memory / device-API / suspend paths); they return
+// ncclInternalError(3) so accidental use fails loudly rather than corrupting.
+extern "C" {
+int ncclDevCommCreate(void*, void*, void*)              { return 3; }
+int ncclDevCommDestroy(void*, void*)                    { return 3; }
+int ncclGetLsaMultimemDevicePointer(void*, void*, void*){ return 3; }
+int ncclPutSignal(void*, void*, void*, void*, void*)    { return 3; }
+int ncclSignal(void*, void*, void*, void*)              { return 3; }
+int ncclWaitSignal(void*, void*, void*)                 { return 3; }
+int ncclCommMemStats(void*, void*)                      { return 3; }
+int ncclCommResume(void*)                               { return 3; }
+int ncclCommSuspend(void*)                              { return 3; }
+}
+CPPEOF
+COPY <<'CPPEOF' /opt/rccl-src/dumpstub.cpp
+// Stub for the C++-mangled ncclCommDump(ncclComm*, unordered_map<string,string>&)
+// that some torch/ROCm builds bind eagerly but RCCL 2.27.7 does not export.
+#include <string>
+#include <unordered_map>
+struct ncclComm;
+typedef int ncclResult_t_compat;
+ncclResult_t_compat ncclCommDump(ncclComm*, std::unordered_map<std::string, std::string>&) { return 0; }
+CPPEOF
+
+RUN mkdir -p /opt/rccl-p2p \
+    && g++ -O2 -shared -fPIC -std=c++17 dumpstub.cpp -o /opt/rccl-p2p/libnccldump_stub.so \
+    && g++ -O2 -shared -fPIC devapistub.cpp -o /opt/rccl-p2p/libnccl_devapi_stub.so \
+    && cp build/librccl.so.1.0 /opt/rccl-p2p/librccl-final.so \
+    && patchelf --add-needed libnccldump_stub.so /opt/rccl-p2p/librccl-final.so \
+    && patchelf --add-needed libnccl_devapi_stub.so /opt/rccl-p2p/librccl-final.so
+
+# Gate 2: torch's eagerly-bound nccl* imports all resolve (library + stubs).
+# Gate 3: every function vLLM's ctypes wrapper looks up exists in the library.
+COPY <<'SHEOF' /opt/rccl-src/check-symbols.sh
+#!/bin/bash
+set -euo pipefail
+TORCH_HIP="$(python3 -c 'import os, torch; print(os.path.join(os.path.dirname(torch.__file__), "lib", "libtorch_hip.so"))')"
+PYNCCL="$(python3 -c 'import os, vllm; print(os.path.join(os.path.dirname(vllm.__file__), "distributed", "device_communicators", "pynccl_wrapper.py"))')"
+nm -D --undefined-only "${TORCH_HIP}" | awk '{print $2}' | grep -i nccl | sort -u > /tmp/torch-needs
+{ nm -D --defined-only /opt/rccl-p2p/librccl-final.so;
+  nm -D --defined-only /opt/rccl-p2p/libnccldump_stub.so;
+  nm -D --defined-only /opt/rccl-p2p/libnccl_devapi_stub.so; } | awk '{print $3}' | sort -u > /tmp/have
+missing="$(comm -23 /tmp/torch-needs /tmp/have || true)"
+echo "torch nccl imports: $(wc -l < /tmp/torch-needs); missing: $(printf '%s' "${missing}" | grep -c . || true)"
+if [ -n "${missing}" ]; then echo "FATAL: unresolved torch nccl symbols:"; echo "${missing}"; exit 1; fi
+grep -o 'Function("nccl[A-Za-z]*"' "${PYNCCL}" | sed 's/Function("//; s/"//' | sort -u > /tmp/vllm-needs
+missing="$(comm -23 /tmp/vllm-needs /tmp/have || true)"
+echo "vLLM pynccl lookups: $(wc -l < /tmp/vllm-needs); missing: $(printf '%s' "${missing}" | grep -c . || true)"
+if [ -n "${missing}" ]; then echo "FATAL: vLLM pynccl_wrapper needs symbols the rebuilt RCCL lacks:"; echo "${missing}"; exit 1; fi
+SHEOF
+RUN bash /opt/rccl-src/check-symbols.sh
+
+# Provenance for anyone inspecting the image.
+RUN { echo "rccl_ref=${RCCL_REF}"; echo "rccl_version=2.27.7"; echo "gpu_target=${GPU_TARGET}"; \
+      echo "rocm_core=$(cat /opt/rocm/core-7.14/.info/version)"; echo "ndebug=1"; \
+      echo "source_issue=devops#1393"; } > /opt/rccl-p2p/BUILD-INFO
+
+# ---------------------------------------------------------------------------
+# Stage 2: the serving image with the rebuilt RCCL installed
+# ---------------------------------------------------------------------------
+FROM docker.io/magiccodingman/vllm-radiance@${RADIANCE_DIGEST}
+
+COPY --from=rccl-build /opt/rccl-p2p/ /opt/rccl-p2p/
+
+# Install over the real file (librccl.so.1 -> librccl.so.1.0 in the core).
+# The rebuilt library carries its own gfx1201 fatbin, so the core's
+# .kpack/rccl_lib_gfx1201.kpack is no longer consulted for it.
+# The stock library is kept at /opt/rccl-stock/ so a triage run can put it
+# back with one --volume line and separate "topology wrong" from "RCCL wrong".
+RUN set -eu; \
+    target="$(readlink -f /opt/rocm/lib/librccl.so.1)"; \
+    case "${target}" in /opt/rocm/core-7.14/lib/librccl.so.1.0) ;; \
+      *) echo "FATAL: unexpected librccl path ${target}"; exit 1;; esac; \
+    libdir="$(dirname "${target}")"; \
+    mkdir -p /opt/rccl-stock; \
+    cp "${target}" /opt/rccl-stock/librccl.so.1.0; \
+    cp /opt/rccl-p2p/librccl-final.so "${target}"; \
+    cp /opt/rccl-p2p/libnccldump_stub.so /opt/rccl-p2p/libnccl_devapi_stub.so "${libdir}/"; \
+    chmod 0644 "${target}" "${libdir}/libnccldump_stub.so" "${libdir}/libnccl_devapi_stub.so"; \
+    ldd "${target}" | grep -q libnccldump_stub.so; \
+    ldd "${target}" | grep -q libnccl_devapi_stub.so; \
+    ! ldd "${target}" | grep -q 'not found'; \
+    python3 -c 'import ctypes, ctypes.util; l = ctypes.CDLL("librccl.so.1"); v = ctypes.c_int(); l.ncclGetVersion(ctypes.byref(v)); print("rccl version", v.value); assert v.value == 22707, v.value'
+
+LABEL org.opencontainers.image.description="vLLM Radiance (pinned digest) with RCCL 2.27.7 rebuilt NDEBUG for gfx1201 P2P under an emulated PCIe switch (devops#1393)" \
+      io.vardalab.rccl.version="2.27.7" \
+      io.vardalab.rccl.ndebug="1" \
+      io.vardalab.source.issue="devops#1393"
